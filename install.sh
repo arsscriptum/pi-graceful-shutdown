@@ -31,6 +31,14 @@ install -m 0755 "$BINARY" "$BINDIR/$BINARY"
 
 echo "Installing configuration to $CONFDIR/"
 install -d "$CONFDIR"
+echo "Installing broadcast template to $CONFDIR/"
+if [ -f "$CONFDIR/broadcast.msg" ]; then
+    echo "  $CONFDIR/broadcast.msg already exists, not overwriting"
+else
+    install -m 0644 "tpl/broadcast.msg" "$CONFDIR/broadcast.msg"
+    echo "  installed $CONFDIR/broadcast.msg"
+fi
+
 if [ -f "$CONFDIR/$CONF" ]; then
     echo "  $CONFDIR/$CONF already exists, not overwriting"
     echo "  (new example installed as $CONFDIR/$CONF_EXAMPLE)"
