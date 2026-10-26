@@ -1,0 +1,13 @@
+[Unit]
+Description=iBoot-G2+ Graceful Shutdown Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/iboot-agent --config /etc/iboot-agent/agent.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
