@@ -5,6 +5,7 @@
  * Mechanism A (heartbeat reply flag) is stubbed pending capture.
  */
 
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -99,8 +100,75 @@ static unsigned short generate_seq(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Hex dump helper                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * hexdump: format raw bytes as hex + printable ASCII for logging.
+ * Inputs: buffer, length, output string (must hold len*3 + 3 + len + 1).
+ */
+static void hexdump(const unsigned char *buf, int len, char *out, int outlen)
+{
+    char *p;
+    int i;
+    int remain;
+
+    p = out;
+    remain = outlen;
+
+    for (i = 0; i < len && remain > 4; i++) {
+        int w;
+        w = snprintf(p, (size_t)remain, "%02x ", buf[i]);
+        p += w;
+        remain -= w;
+    }
+
+    if (remain > len + 3) {
+        *p++ = '|';
+        remain--;
+        for (i = 0; i < len && remain > 1; i++) {
+            *p = (buf[i] >= 0x20 && buf[i] <= 0x7e)
+                 ? (char)buf[i] : '.';
+            p++;
+            remain--;
+        }
+        *p++ = '|';
+    }
+    *p = '\0';
+}
+
+/* ------------------------------------------------------------------ */
 /* Mechanism B: inbound command                                       */
 /* ------------------------------------------------------------------ */
+
+/*
+ * recv_accumulate: read from fd in a loop until no more data arrives.
+ * Uses a short inter-read timeout so the final read does not block
+ * longer than drain_timeout_s seconds.
+ * Returns: total bytes read, or -1 if nothing arrived at all.
+ */
+static int recv_accumulate(int fd, unsigned char *buf, int bufsize,
+                           int first_timeout_s, int drain_timeout_s)
+{
+    int total = 0;
+    int n;
+
+    set_recv_timeout(fd, first_timeout_s);
+
+    while (total < bufsize) {
+        n = (int)recv(fd, buf + total, (size_t)(bufsize - total), 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        total += n;
+        /* After first chunk, use a short timeout to drain remaining */
+        set_recv_timeout(fd, drain_timeout_s);
+    }
+
+    return (total > 0) ? total : -1;
+}
 
 int signal_source_handle_connection(int conn_fd,
                                     const struct config *cfg,
@@ -108,10 +176,15 @@ int signal_source_handle_connection(int conn_fd,
 {
     unsigned char hello_buf[DXP_HELLO_LEN];
     unsigned char seq_buf[DXP_SEQ_LEN];
-    unsigned char hdr_buf[DXP_HDR_SIZE];
-    unsigned char resp;
+    unsigned char raw[1024];
     unsigned short initial_seq;
-    dxp_header_t hdr;
+    char dump[512];
+    int raw_len;
+    int json_start;
+    int json_len;
+
+    (void)cfg;
+    (void)event;
 
     set_recv_timeout(conn_fd, RECV_TIMEOUT_S);
 
@@ -127,7 +200,7 @@ int signal_source_handle_connection(int conn_fd,
 
     log_msg(LOG_DEBUG, "connection: hello received");
 
-    /* Send sequence number */
+    /* Send sequence number (DxP handshake) */
     initial_seq = generate_seq();
     dxp_write_seq(seq_buf, initial_seq);
     if (send_all(conn_fd, seq_buf, DXP_SEQ_LEN) < 0) {
@@ -137,69 +210,78 @@ int signal_source_handle_connection(int conn_fd,
 
     log_msg(LOG_DEBUG, "connection: sent seq %u", (unsigned)initial_seq);
 
-    /* Receive header */
-    if (recv_exact(conn_fd, hdr_buf, DXP_HDR_SIZE) < 0) {
-        log_msg(LOG_WARNING, "connection: failed to receive header");
+    /* Accumulate all data from iBoot (up to 1024 bytes).
+       First read waits 10s, subsequent reads drain with 3s timeout. */
+    raw_len = recv_accumulate(conn_fd, raw, (int)sizeof(raw) - 1,
+                              RECV_TIMEOUT_S, 3);
+    if (raw_len <= 0) {
+        log_msg(LOG_WARNING, "connection: no data after hello/seq");
         return -1;
     }
 
-    dxp_parse_header(hdr_buf, &hdr);
+    /* Null-terminate for safe string operations */
+    raw[raw_len] = '\0';
 
-    log_msg(LOG_DEBUG,
-            "connection: command=%s(%u) desc=%u param=%u seq=%u",
-            dxp_command_name(hdr.command), (unsigned)hdr.command,
-            (unsigned)hdr.desc, (unsigned)hdr.param, (unsigned)hdr.seq);
+    log_msg(LOG_INFO, "connection: received %d bytes total", raw_len);
 
-    /* Validate sequence */
-    if (hdr.seq != (unsigned short)(initial_seq + 1)) {
-        log_msg(LOG_WARNING,
-                "connection: bad sequence: expected %u, got %u",
-                (unsigned)(unsigned short)(initial_seq + 1),
-                (unsigned)hdr.seq);
-        resp = DXP_RESP_ERROR;
-        send_all(conn_fd, &resp, 1);
-        return -1;
+    /* Hex dump first 128 bytes */
+    {
+        int dumplen;
+        dumplen = (raw_len > 128) ? 128 : raw_len;
+        hexdump(raw, dumplen, dump, (int)sizeof(dump));
+        log_msg(LOG_DEBUG, "connection: hex[0..%d]: %s",
+                dumplen - 1, dump);
     }
 
-    /* Validate credentials */
-    if (!dxp_validate_credentials(&hdr, cfg->shared_username,
-                                  cfg->shared_password)) {
-        log_msg(LOG_WARNING,
-                "connection: authentication failure (user='%s')",
-                hdr.username);
-        resp = DXP_RESP_ERROR;
-        send_all(conn_fd, &resp, 1);
-        return -1;
-    }
-
-    log_msg(LOG_DEBUG, "connection: credentials validated");
-
-    /* Send ACK */
-    resp = DXP_RESP_OK;
-    send_all(conn_fd, &resp, 1);
-
-    /* Check for shutdown command */
-    if (dxp_is_shutdown_command(&hdr)) {
-        log_msg(LOG_INFO,
-                "received authenticated shutdown signal: "
-                "command=%s(%u) desc=%u",
-                dxp_command_name(hdr.command), (unsigned)hdr.command,
-                (unsigned)hdr.desc);
-
-        if (event != NULL) {
-            event->command = hdr.command;
-            event->desc = hdr.desc;
-            event->source_ip[0] = '\0';
+    /* Find the JSON payload (skip any prefix bytes before '{') */
+    json_start = -1;
+    {
+        int i;
+        for (i = 0; i < raw_len; i++) {
+            if (raw[i] == '{') {
+                json_start = i;
+                break;
+            }
         }
-        return 0;
     }
 
+    if (json_start < 0) {
+        log_msg(LOG_WARNING,
+                "connection: no JSON found in %d bytes", raw_len);
+        return -1;
+    }
+
+    if (json_start > 0) {
+        log_msg(LOG_DEBUG,
+                "connection: %d prefix byte(s) before JSON: "
+                "first=0x%02x",
+                json_start, raw[0]);
+    }
+
+    json_len = raw_len - json_start;
+    log_msg(LOG_INFO, "connection: JSON payload (%d bytes): %.*s",
+            json_len, json_len, (char *)(raw + json_start));
+
+    /* Dump any trailing bytes after the first 128 if message is long */
+    if (raw_len > 128) {
+        int tail;
+        tail = raw_len - 128;
+        if (tail > 128) tail = 128;
+        hexdump(raw + 128, tail, dump, (int)sizeof(dump));
+        log_msg(LOG_DEBUG, "connection: hex[128..%d]: %s",
+                128 + tail - 1, dump);
+    }
+
+    /*
+     * TODO: parse JSON to extract command, credentials, and
+     * shutdown signal. For now, log the full payload for protocol
+     * analysis. The agent does not act on this data yet.
+     */
     log_msg(LOG_INFO,
-            "received authenticated non-shutdown command: "
-            "command=%s(%u) desc=%u (ignored)",
-            dxp_command_name(hdr.command), (unsigned)hdr.command,
-            (unsigned)hdr.desc);
-    return 1;
+            "connection: JSON protocol detected; capture complete. "
+            "No action taken (protocol handler not yet implemented).");
+
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
