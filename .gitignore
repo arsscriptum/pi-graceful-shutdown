@@ -82,4 +82,5 @@ dlldata.c
 CLAUDE.md
 
 references/
-.claude/
+.claude/iboot-agent
+dxp_decode_test

@@ -1,5 +1,6 @@
 CC      = cc
-CFLAGS  = -ansi -pedantic -Wall -Wextra -O2 -D_POSIX_C_SOURCE=200112L
+CFLAGS  = -ansi -pedantic -Wall -Wextra -O2 \
+          -D_POSIX_C_SOURCE=200112L -D_DEFAULT_SOURCE
 LDFLAGS =
 
 PREFIX     = /usr/local
@@ -7,24 +8,46 @@ SBINDIR    = $(PREFIX)/sbin
 CONFDIR    = /etc/iboot-agent
 UNITDIR    = /etc/systemd/system
 
+SRCDIR     = src
+TESTDIR    = test
+
 AGENT      = iboot-agent
-TEST       = test_dxp
+TEST       = dxp_decode_test
+
+SRCS       = $(SRCDIR)/main.c \
+             $(SRCDIR)/config.c \
+             $(SRCDIR)/dxp.c \
+             $(SRCDIR)/halt.c \
+             $(SRCDIR)/log.c \
+             $(SRCDIR)/session.c \
+             $(SRCDIR)/signal_source.c
+
+OBJS       = $(SRCS:.c=.o)
+
+TEST_SRCS  = $(TESTDIR)/dxp_decode_test.c $(SRCDIR)/dxp.c
+TEST_OBJS  = $(TEST_SRCS:.c=.o)
 
 .PHONY: all clean test install
 
 all: $(AGENT) $(TEST)
 
-$(AGENT): iboot-agent.c dxp.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ iboot-agent.c
+$(SRCDIR)/%.o: $(SRCDIR)/%.c
+	$(CC) $(CFLAGS) -I$(SRCDIR) -c -o $@ $<
 
-$(TEST): test_dxp.c dxp.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ test_dxp.c
+$(TESTDIR)/%.o: $(TESTDIR)/%.c
+	$(CC) $(CFLAGS) -I$(SRCDIR) -c -o $@ $<
+
+$(AGENT): $(OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
+
+$(TEST): $(TEST_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(TEST_OBJS)
 
 test: $(TEST)
 	./$(TEST)
 
 clean:
-	rm -f $(AGENT) $(TEST)
+	rm -f $(AGENT) $(TEST) $(SRCDIR)/*.o $(TESTDIR)/*.o
 
 install: $(AGENT)
 	install -d $(DESTDIR)$(SBINDIR)
