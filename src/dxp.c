@@ -76,3 +76,36 @@ const char *dxp_command_name(unsigned char cmd)
     default:                 return "unknown";
     }
 }
+
+/*
+ * JSON envelope constants.  The tag is checked after the opening
+ * brace; the offset is from '{' to the first byte of the embedded
+ * 47-byte DxP header.
+ */
+#define DXP_JSON_TAG         "\"hdr\":"
+#define DXP_JSON_TAG_LEN     6
+#define DXP_JSON_HDR_OFFSET  21
+
+int dxp_parse_json_envelope(const unsigned char *buf, int len,
+                            dxp_header_t *hdr)
+{
+    int brace;
+    int i;
+
+    brace = -1;
+    for (i = 0; i < len; i++) {
+        if (buf[i] == '{') {
+            brace = i;
+            break;
+        }
+    }
+    if (brace < 0) return -1;
+
+    if (len - brace < DXP_JSON_HDR_OFFSET + DXP_HDR_SIZE) return -1;
+
+    if (memcmp(&buf[brace + 1], DXP_JSON_TAG, DXP_JSON_TAG_LEN) != 0)
+        return -1;
+
+    dxp_parse_header(&buf[brace + DXP_JSON_HDR_OFFSET], hdr);
+    return 0;
+}

@@ -177,14 +177,10 @@ int signal_source_handle_connection(int conn_fd,
     unsigned char hello_buf[DXP_HELLO_LEN];
     unsigned char seq_buf[DXP_SEQ_LEN];
     unsigned char raw[1024];
-    unsigned short initial_seq;
     char dump[512];
+    dxp_header_t hdr;
+    unsigned short initial_seq;
     int raw_len;
-    int json_start;
-    int json_len;
-
-    (void)cfg;
-    (void)event;
 
     set_recv_timeout(conn_fd, RECV_TIMEOUT_S);
 
@@ -233,55 +229,54 @@ int signal_source_handle_connection(int conn_fd,
                 dumplen - 1, dump);
     }
 
-    /* Find the JSON payload (skip any prefix bytes before '{') */
-    json_start = -1;
-    {
-        int i;
-        for (i = 0; i < raw_len; i++) {
-            if (raw[i] == '{') {
-                json_start = i;
-                break;
-            }
-        }
-    }
-
-    if (json_start < 0) {
+    /* Try JSON-envelope DxP (firmware v1.40.60+), then raw DxP */
+    if (dxp_parse_json_envelope(raw, raw_len, &hdr) == 0) {
+        log_msg(LOG_DEBUG,
+                "connection: parsed DxP from JSON envelope");
+    } else if (raw_len >= DXP_HDR_SIZE) {
+        dxp_parse_header(raw, &hdr);
+        log_msg(LOG_DEBUG,
+                "connection: parsed raw DxP header");
+    } else {
         log_msg(LOG_WARNING,
-                "connection: no JSON found in %d bytes", raw_len);
+                "connection: unrecognized frame (%d bytes)", raw_len);
         return -1;
     }
 
-    if (json_start > 0) {
-        log_msg(LOG_DEBUG,
-                "connection: %d prefix byte(s) before JSON: "
-                "first=0x%02x",
-                json_start, raw[0]);
+    log_msg(LOG_DEBUG,
+            "connection: command=%s(%u) desc=%u param=%u seq=%u",
+            dxp_command_name(hdr.command),
+            (unsigned)hdr.command,
+            (unsigned)hdr.desc,
+            (unsigned)hdr.param,
+            (unsigned)hdr.seq);
+
+    if (!dxp_validate_credentials(&hdr,
+                                   cfg->shared_username,
+                                   cfg->shared_password)) {
+        log_msg(LOG_WARNING,
+                "connection: credential mismatch, rejecting");
+        return -1;
     }
 
-    json_len = raw_len - json_start;
-    log_msg(LOG_INFO, "connection: JSON payload (%d bytes): %.*s",
-            json_len, json_len, (char *)(raw + json_start));
+    log_msg(LOG_INFO, "connection: credentials validated");
 
-    /* Dump any trailing bytes after the first 128 if message is long */
-    if (raw_len > 128) {
-        int tail;
-        tail = raw_len - 128;
-        if (tail > 128) tail = 128;
-        hexdump(raw + 128, tail, dump, (int)sizeof(dump));
-        log_msg(LOG_DEBUG, "connection: hex[128..%d]: %s",
-                128 + tail - 1, dump);
+    if (dxp_is_shutdown_command(&hdr)) {
+        event->command = hdr.command;
+        event->desc = hdr.desc;
+        log_msg(LOG_INFO,
+                "connection: shutdown signal received "
+                "(command=%s desc=%u)",
+                dxp_command_name(hdr.command),
+                (unsigned)hdr.desc);
+        return 0;
     }
 
-    /*
-     * TODO: parse JSON to extract command, credentials, and
-     * shutdown signal. For now, log the full payload for protocol
-     * analysis. The agent does not act on this data yet.
-     */
     log_msg(LOG_INFO,
-            "connection: JSON protocol detected; capture complete. "
-            "No action taken (protocol handler not yet implemented).");
-
-    return -1;
+            "connection: non-shutdown command=%s(%u), ignoring",
+            dxp_command_name(hdr.command),
+            (unsigned)hdr.command);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */

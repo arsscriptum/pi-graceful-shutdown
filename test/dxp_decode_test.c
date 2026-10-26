@@ -365,6 +365,86 @@ static void test_wire_size_47(void)
     ASSERT_EQ_UINT("wire[46] seq high", 0xDD, wire[46]);
 }
 
+/* ------------------------------------------------------------------ */
+/* Reference capture: 69-byte JSON-envelope frame from iBoot v1.40.60 */
+/* ------------------------------------------------------------------ */
+
+static const unsigned char capture_frame[69] = {
+    /* 0x00 prefix */
+    0x00,
+    /* JSON envelope: {"hdr":{"uuid": "<?d  */
+    0x7b, 0x22, 0x68, 0x64, 0x72, 0x22, 0x3a, 0x7b,
+    0x22, 0x75, 0x75, 0x69, 0x64, 0x22, 0x3a, 0x20,
+    0x22, 0x3c, 0x3f, 0x64, 0x20,
+    /* DxP header: command=pcControl(7) */
+    0x07,
+    /* username: "admin" + null padding (21 bytes) */
+    0x61, 0x64, 0x6d, 0x69, 0x6e, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    /* password: test credential + null padding (21 bytes) */
+    0x53, 0x65, 0x63, 0x72, 0x65, 0x74, 0x54, 0x65,
+    0x73, 0x74, 0x32, 0x33, 0x5f, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    /* desc=2, param=0, seq=0x3A3B (LE) */
+    0x02, 0x00, 0x3b, 0x3a
+};
+
+static void test_json_envelope_capture(void)
+{
+    dxp_header_t hdr;
+    int rc;
+
+    printf("--- dxp_parse_json_envelope (reference capture) ---\n");
+
+    rc = dxp_parse_json_envelope(capture_frame, 69, &hdr);
+    ASSERT_EQ_INT("envelope parse ok", 0, rc);
+    ASSERT_EQ_UINT("envelope cmd", DXP_CMND_PCCONTROL, hdr.command);
+    ASSERT_EQ_STR("envelope user", "admin", hdr.username);
+    ASSERT_EQ_STR("envelope pass", "SecretTest23_", hdr.password);
+    ASSERT_EQ_UINT("envelope desc", 2, hdr.desc);
+    ASSERT_EQ_UINT("envelope param", 0, hdr.param);
+    ASSERT_EQ_UINT("envelope seq", 0x3A3B, hdr.seq);
+
+    ASSERT_EQ_INT("envelope is shutdown", 1,
+                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("envelope cred match", 1,
+                  dxp_validate_credentials(&hdr, "admin",
+                                           "SecretTest23_"));
+    ASSERT_EQ_INT("envelope cred reject", 0,
+                  dxp_validate_credentials(&hdr, "admin", "wrong"));
+}
+
+static void test_json_envelope_edge_cases(void)
+{
+    unsigned char short_buf[40];
+    unsigned char no_json[47];
+    unsigned char bad_tag[69];
+    dxp_header_t hdr;
+
+    printf("--- dxp_parse_json_envelope (edge cases) ---\n");
+
+    /* Truncated frame: too short for envelope + DxP header */
+    memcpy(short_buf, capture_frame, 40);
+    ASSERT_EQ_INT("truncated rejected", -1,
+                  dxp_parse_json_envelope(short_buf, 40, &hdr));
+
+    /* No JSON brace at all */
+    memset(no_json, 0x41, sizeof(no_json));
+    ASSERT_EQ_INT("no brace rejected", -1,
+                  dxp_parse_json_envelope(no_json, 47, &hdr));
+
+    /* Wrong envelope tag (correct brace but bad field name) */
+    memcpy(bad_tag, capture_frame, 69);
+    bad_tag[2] = 'x';
+    ASSERT_EQ_INT("bad tag rejected", -1,
+                  dxp_parse_json_envelope(bad_tag, 69, &hdr));
+
+    /* Empty buffer */
+    ASSERT_EQ_INT("empty rejected", -1,
+                  dxp_parse_json_envelope(no_json, 0, &hdr));
+}
+
 static void test_hello_constant(void)
 {
     printf("--- hello constant ---\n");
@@ -410,6 +490,8 @@ int main(void)
     test_wire_size_47();
     test_hello_constant();
     test_seq_wraparound();
+    test_json_envelope_capture();
+    test_json_envelope_edge_cases();
 
     printf("\n%d passed, %d failed, %d total\n",
            g_pass, g_fail, g_pass + g_fail);

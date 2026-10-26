@@ -5,7 +5,7 @@
 
 # IPv4 address or hostname of the iBoot-G2+ unit.
 # Used for source-IP validation and for outbound heartbeat connections.
-iboot_address = 192.168.1.100
+iboot_address = 10.0.0.51
 
 # DxP port on the iBoot (default 9100).
 # Used for outbound heartbeat connections to the iBoot.
@@ -14,21 +14,22 @@ iboot_port = 9100
 # Shared credentials -- must match the iBoot Graceful Shutdown page
 # (Main outlet) exactly.  Maximum 20 characters each.
 shared_username = admin
-shared_password = CHANGEME
+shared_password = SecretTest23_
 
 # Address and port the agent listens on for inbound DxP connections
 # from the iBoot.  Use a specific interface address, not 0.0.0.0.
-listen_address = 192.168.1.50
+listen_address = 10.0.0.106
 listen_port = 9100
 
 # Heartbeat interval in seconds.  If greater than zero, the agent
 # periodically connects to the iBoot and sends a DxP keepAlive.
 # Set to 0 to disable outbound heartbeat.
-heartbeat_interval_seconds = 30
+heartbeat_interval_seconds = 10
 
 # Command to execute on receiving an authenticated shutdown signal.
 # Both Off and Cycle trigger this same command (see Section 3 in CLAUDE.md).
-halt_command = /sbin/poweroff
+#halt_command = /sbin/poweroff
+halt_command = /home/gp/graceful-powerdown
 
 # Logging level: error, warn, info, debug.
 # Use --verbose on the command line to force debug level.

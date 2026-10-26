@@ -144,4 +144,21 @@ int dxp_is_shutdown_command(const dxp_header_t *hdr);
  */
 const char *dxp_command_name(unsigned char cmd);
 
+/*
+ * dxp_parse_json_envelope: extract a DxP header from a JSON-wrapped frame.
+ *
+ * iBoot firmware v1.40.60+ wraps the 47-byte DxP binary header inside
+ * a JSON-like envelope.  The wire layout is:
+ *   [0x00 prefix] {"hdr":{"uuid": "XXXX [47-byte DxP header]
+ * where XXXX is a 4-byte device marker.  The DxP header starts 21
+ * bytes after the opening brace.
+ *
+ * Inputs: raw frame buffer (as received after hello/seq handshake),
+ *         buffer length, output header struct.
+ * Returns: 0 on success (header populated), -1 if the frame does not
+ *          contain a recognizable JSON envelope.
+ */
+int dxp_parse_json_envelope(const unsigned char *buf, int len,
+                            dxp_header_t *hdr);
+
 #endif /* DXP_H */
