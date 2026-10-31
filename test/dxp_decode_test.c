@@ -2,7 +2,7 @@
  * dxp_decode_test.c - Unit tests for the DxP protocol decoder
  *
  * Tests dxp_parse_header, dxp_build_header, dxp_read_seq,
- * dxp_write_seq, dxp_validate_credentials, dxp_is_shutdown_command,
+ * dxp_write_seq, dxp_validate_credentials, dxp_classify_shutdown,
  * and dxp_command_name against known-good wire data.
  *
  * Build: cc -ansi -pedantic -Wall -Wextra -I../src -o dxp_decode_test \
@@ -236,60 +236,120 @@ static void test_validate_credentials(void)
                   dxp_validate_credentials(&hdr, "Admin", "Secret"));
 }
 
-static void test_is_shutdown_command(void)
+static void test_classify_shutdown(void)
 {
+    unsigned char cr[DXP_CHANGERELAY_PAYLOAD_LEN];
     dxp_header_t hdr;
 
-    printf("--- dxp_is_shutdown_command ---\n");
+    printf("--- dxp_classify_shutdown ---\n");
 
     memset(&hdr, 0, sizeof(hdr));
 
-    /* pcControl (command 7) is always a shutdown */
+    /* pcControl (command 7) is always a shutdown, payload or not */
     hdr.command = DXP_CMND_PCCONTROL;
     hdr.desc = 0;
-    ASSERT_EQ_INT("pcControl desc=0", 1,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("pcControl desc=0", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, NULL, 0));
 
     hdr.desc = 1;
-    ASSERT_EQ_INT("pcControl desc=1", 1,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("pcControl desc=1", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, NULL, 0));
+
+    hdr.desc = 2;
+    ASSERT_EQ_INT("pcControl desc=2 (capture)", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, NULL, 0));
 
     hdr.desc = 0xFF;
-    ASSERT_EQ_INT("pcControl desc=0xFF", 1,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("pcControl desc=0xFF", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, NULL, 0));
 
-    /* io/changeRelay (command 3, desc 1) is a shutdown */
+    /* io/changeRelay with state RELAX: power dropping, do halt */
     hdr.command = DXP_CMND_IO;
     hdr.desc = DXP_IO_CHANGE_RELAY;
-    ASSERT_EQ_INT("io/changeRelay", 1,
-                  dxp_is_shutdown_command(&hdr));
+    cr[DXP_CR_OFF_RELAY] = 0;
+    cr[DXP_CR_OFF_STATE] = DXP_RELAY_RELAX;
+    ASSERT_EQ_INT("io/changeRelay RELAX", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
+
+    /*
+     * io/changeRelay with state ENERGIZE: the outlet coming ON.
+     * This is the regression.  The old header-only classifier halted
+     * here, so an outlet-on command reset the Pi from a distance.
+     */
+    cr[DXP_CR_OFF_STATE] = DXP_RELAY_ENERGIZE;
+    ASSERT_EQ_INT("io/changeRelay ENERGIZE not shutdown",
+                  DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
+
+    /* io/changeRelay with state NO_CHANGE is not a shutdown either */
+    cr[DXP_CR_OFF_STATE] = DXP_RELAY_NO_CHANGE;
+    ASSERT_EQ_INT("io/changeRelay NO_CHANGE not shutdown",
+                  DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
+
+    /* Unknown relay state is not a shutdown */
+    cr[DXP_CR_OFF_STATE] = 0x7F;
+    ASSERT_EQ_INT("io/changeRelay unknown state not shutdown",
+                  DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
+
+    /* Relay index must not affect the verdict, only the state does */
+    cr[DXP_CR_OFF_RELAY] = 3;
+    cr[DXP_CR_OFF_STATE] = DXP_RELAY_RELAX;
+    ASSERT_EQ_INT("io/changeRelay relay=3 RELAX", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
+
+    /* changeRelay with a truncated or absent payload: no verdict */
+    ASSERT_EQ_INT("io/changeRelay no payload", DXP_SHUTDOWN_NO_STATE,
+                  dxp_classify_shutdown(&hdr, NULL, 0));
+    ASSERT_EQ_INT("io/changeRelay 1-byte payload",
+                  DXP_SHUTDOWN_NO_STATE,
+                  dxp_classify_shutdown(&hdr, cr, 1));
+
+    /* A payload longer than 2 bytes still reads the state at offset 1 */
+    cr[DXP_CR_OFF_STATE] = DXP_RELAY_ENERGIZE;
+    ASSERT_EQ_INT("io/changeRelay long payload ENERGIZE",
+                  DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr, 8));
 
     /* io with other descriptors is not a shutdown */
     hdr.desc = DXP_IO_GET_RELAY;
-    ASSERT_EQ_INT("io/getRelay not shutdown", 0,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("io/getRelay not shutdown", DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
 
     hdr.desc = DXP_IO_NULL;
-    ASSERT_EQ_INT("io/null not shutdown", 0,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("io/null not shutdown", DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
 
-    /* Other commands are not shutdowns */
+    /* Other commands are not shutdowns, even carrying a RELAX byte */
+    cr[DXP_CR_OFF_STATE] = DXP_RELAY_RELAX;
     hdr.command = DXP_CMND_KEEPALIVE;
     hdr.desc = 0;
-    ASSERT_EQ_INT("keepAlive not shutdown", 0,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("keepAlive not shutdown", DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
 
     hdr.command = DXP_CMND_GET;
-    ASSERT_EQ_INT("get not shutdown", 0,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("get not shutdown", DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
 
     hdr.command = DXP_CMND_SET;
-    ASSERT_EQ_INT("set not shutdown", 0,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("set not shutdown", DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
 
     hdr.command = DXP_CMND_NULL;
-    ASSERT_EQ_INT("null not shutdown", 0,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("null not shutdown", DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr, cr,
+                                        DXP_CHANGERELAY_PAYLOAD_LEN));
 }
 
 static void test_command_name(void)
@@ -394,11 +454,17 @@ static void test_json_envelope_capture(void)
 {
     dxp_header_t hdr;
     int rc;
+    int hdr_off;
 
     printf("--- dxp_parse_json_envelope (reference capture) ---\n");
 
-    rc = dxp_parse_json_envelope(capture_frame, 69, &hdr);
+    hdr_off = -1;
+    rc = dxp_parse_json_envelope(capture_frame, 69, &hdr, &hdr_off);
     ASSERT_EQ_INT("envelope parse ok", 0, rc);
+    ASSERT_EQ_INT("envelope header offset", 22, hdr_off);
+    /* The capture is header-only: 22 prefix + 47 header = 69 bytes */
+    ASSERT_EQ_INT("envelope payload empty", 0,
+                  69 - hdr_off - DXP_HDR_SIZE);
     ASSERT_EQ_UINT("envelope cmd", DXP_CMND_PCCONTROL, hdr.command);
     ASSERT_EQ_STR("envelope user", "admin", hdr.username);
     ASSERT_EQ_STR("envelope pass", "SecretTest23_", hdr.password);
@@ -406,8 +472,8 @@ static void test_json_envelope_capture(void)
     ASSERT_EQ_UINT("envelope param", 0, hdr.param);
     ASSERT_EQ_UINT("envelope seq", 0x3A3B, hdr.seq);
 
-    ASSERT_EQ_INT("envelope is shutdown", 1,
-                  dxp_is_shutdown_command(&hdr));
+    ASSERT_EQ_INT("envelope is shutdown", DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr, capture_frame + 69, 0));
     ASSERT_EQ_INT("envelope cred match", 1,
                   dxp_validate_credentials(&hdr, "admin",
                                            "SecretTest23_"));
@@ -421,28 +487,98 @@ static void test_json_envelope_edge_cases(void)
     unsigned char no_json[47];
     unsigned char bad_tag[69];
     dxp_header_t hdr;
+    int hdr_off;
 
     printf("--- dxp_parse_json_envelope (edge cases) ---\n");
 
     /* Truncated frame: too short for envelope + DxP header */
     memcpy(short_buf, capture_frame, 40);
     ASSERT_EQ_INT("truncated rejected", -1,
-                  dxp_parse_json_envelope(short_buf, 40, &hdr));
+                  dxp_parse_json_envelope(short_buf, 40, &hdr,
+                                          &hdr_off));
 
     /* No JSON brace at all */
     memset(no_json, 0x41, sizeof(no_json));
     ASSERT_EQ_INT("no brace rejected", -1,
-                  dxp_parse_json_envelope(no_json, 47, &hdr));
+                  dxp_parse_json_envelope(no_json, 47, &hdr,
+                                          &hdr_off));
 
     /* Wrong envelope tag (correct brace but bad field name) */
     memcpy(bad_tag, capture_frame, 69);
     bad_tag[2] = 'x';
     ASSERT_EQ_INT("bad tag rejected", -1,
-                  dxp_parse_json_envelope(bad_tag, 69, &hdr));
+                  dxp_parse_json_envelope(bad_tag, 69, &hdr,
+                                          &hdr_off));
 
     /* Empty buffer */
     ASSERT_EQ_INT("empty rejected", -1,
-                  dxp_parse_json_envelope(no_json, 0, &hdr));
+                  dxp_parse_json_envelope(no_json, 0, &hdr,
+                                          &hdr_off));
+
+    /* A NULL offset argument is allowed */
+    ASSERT_EQ_INT("null offset arg accepted", 0,
+                  dxp_parse_json_envelope(capture_frame, 69, &hdr,
+                                          NULL));
+}
+
+/*
+ * test_envelope_changerelay: a synthetic JSON-envelope changeRelay
+ * frame, built on the real capture prefix, with the 2-byte relay
+ * payload appended.  Exercises the full decode path the daemon uses:
+ * locate the header inside the envelope, then read the relay state
+ * from the bytes after it.
+ */
+static void test_envelope_changerelay(void)
+{
+    unsigned char frame[69 + DXP_CHANGERELAY_PAYLOAD_LEN];
+    dxp_header_t hdr;
+    int hdr_off;
+    int payload_len;
+
+    printf("--- envelope changeRelay (relay state decides) ---\n");
+
+    memcpy(frame, capture_frame, 69);
+    frame[22 + DXP_HDR_OFF_COMMAND] = DXP_CMND_IO;
+    frame[22 + DXP_HDR_OFF_DESC] = DXP_IO_CHANGE_RELAY;
+    frame[69 + DXP_CR_OFF_RELAY] = 0;
+
+    hdr_off = -1;
+    ASSERT_EQ_INT("cr envelope parse ok", 0,
+                  dxp_parse_json_envelope(frame, (int)sizeof(frame),
+                                          &hdr, &hdr_off));
+    ASSERT_EQ_INT("cr header offset", 22, hdr_off);
+
+    payload_len = (int)sizeof(frame) - hdr_off - DXP_HDR_SIZE;
+    ASSERT_EQ_INT("cr payload length", DXP_CHANGERELAY_PAYLOAD_LEN,
+                  payload_len);
+
+    /* ENERGIZE: outlet turning on, must not halt */
+    frame[69 + DXP_CR_OFF_STATE] = DXP_RELAY_ENERGIZE;
+    ASSERT_EQ_INT("cr envelope ENERGIZE not shutdown",
+                  DXP_SHUTDOWN_NO,
+                  dxp_classify_shutdown(&hdr,
+                                        frame + hdr_off + DXP_HDR_SIZE,
+                                        payload_len));
+
+    /* RELAX: outlet dropping, must halt */
+    frame[69 + DXP_CR_OFF_STATE] = DXP_RELAY_RELAX;
+    ASSERT_EQ_INT("cr envelope RELAX is shutdown",
+                  DXP_SHUTDOWN_YES,
+                  dxp_classify_shutdown(&hdr,
+                                        frame + hdr_off + DXP_HDR_SIZE,
+                                        payload_len));
+
+    /* Same frame truncated to the header: no state, so no halt */
+    ASSERT_EQ_INT("cr envelope truncated payload",
+                  DXP_SHUTDOWN_NO_STATE,
+                  dxp_classify_shutdown(&hdr,
+                                        frame + hdr_off + DXP_HDR_SIZE,
+                                        0));
+
+    /* Credentials from the capture survive the header edit */
+    ASSERT_EQ_INT("cr envelope cred match", 1,
+                  dxp_validate_credentials(&hdr, "admin",
+                                           "SecretTest23_"));
 }
 
 static void test_hello_constant(void)
@@ -485,13 +621,14 @@ int main(void)
     test_parse_header();
     test_build_header();
     test_validate_credentials();
-    test_is_shutdown_command();
+    test_classify_shutdown();
     test_command_name();
     test_wire_size_47();
     test_hello_constant();
     test_seq_wraparound();
     test_json_envelope_capture();
     test_json_envelope_edge_cases();
+    test_envelope_changerelay();
 
     printf("\n%d passed, %d failed, %d total\n",
            g_pass, g_fail, g_pass + g_fail);

@@ -70,6 +70,21 @@
 #define DXP_RELAY_ENERGIZE    1
 #define DXP_RELAY_RELAX       2
 
+/*
+ * ChangeRelay payload (follows the 47-byte header):
+ *   offset 0: relay index (1 byte)
+ *   offset 1: new state   (1 byte, one of the DXP_RELAY_* values)
+ * Total changeRelay frame is 47 + 2 = 49 bytes.
+ */
+#define DXP_CHANGERELAY_PAYLOAD_LEN 2
+#define DXP_CR_OFF_RELAY            0
+#define DXP_CR_OFF_STATE            1
+
+/* dxp_classify_shutdown results */
+#define DXP_SHUTDOWN_NO        0
+#define DXP_SHUTDOWN_YES       1
+#define DXP_SHUTDOWN_NO_STATE  (-1)
+
 /* KeepAlive descriptor */
 #define DXP_KEEPALIVE_NULL    0
 
@@ -129,13 +144,32 @@ int dxp_validate_credentials(const dxp_header_t *hdr,
                              const char *password);
 
 /*
- * dxp_is_shutdown_command: determine if a parsed header represents
- * a shutdown signal.
- * Accepts eCmnd_pcControl (7) with any descriptor, and
- * eCmnd_io (3) with eIO_changeRelay (1).
- * Returns: 1 if shutdown, 0 otherwise.
+ * dxp_classify_shutdown: decide whether a parsed frame is a
+ * shutdown signal.
+ *
+ * Only two things halt the host:
+ *   - eCmnd_pcControl (7): the graceful-shutdown command, which the
+ *     reference capture shows arriving header-only.
+ *   - eCmnd_io (3) with eIO_changeRelay (1) carrying state RELAX,
+ *     i.e. the outlet relay de-energizing, so power is about to drop.
+ *
+ * The relay state is not in the header.  It lives in the 2-byte
+ * changeRelay payload [relay index, state] that follows the header,
+ * so that payload must be supplied for a changeRelay verdict.  A
+ * changeRelay carrying ENERGIZE (the outlet coming on) or NO_CHANGE
+ * is not a shutdown and must never halt the host.
+ *
+ * Inputs: parsed header; the payload bytes following the header (may
+ *         be NULL when payload_len is 0); payload length in bytes.
+ * Returns: DXP_SHUTDOWN_YES if the frame is a shutdown signal,
+ *          DXP_SHUTDOWN_NO if it is not, or DXP_SHUTDOWN_NO_STATE
+ *          when a changeRelay arrived without a readable state
+ *          payload.  NO_STATE must be treated as not-a-shutdown by
+ *          the caller, but is distinct so it can be logged.
  */
-int dxp_is_shutdown_command(const dxp_header_t *hdr);
+int dxp_classify_shutdown(const dxp_header_t *hdr,
+                          const unsigned char *payload,
+                          int payload_len);
 
 /*
  * dxp_command_name: return a human-readable name for a command class.
@@ -154,11 +188,14 @@ const char *dxp_command_name(unsigned char cmd);
  * bytes after the opening brace.
  *
  * Inputs: raw frame buffer (as received after hello/seq handshake),
- *         buffer length, output header struct.
- * Returns: 0 on success (header populated), -1 if the frame does not
- *          contain a recognizable JSON envelope.
+ *         buffer length, output header struct, and optional output
+ *         offset of the embedded header within the frame (may be
+ *         NULL).  The caller needs that offset to locate any command
+ *         payload following the header.
+ * Returns: 0 on success (header and hdr_off populated), -1 if the
+ *          frame does not contain a recognizable JSON envelope.
  */
 int dxp_parse_json_envelope(const unsigned char *buf, int len,
-                            dxp_header_t *hdr);
+                            dxp_header_t *hdr, int *hdr_off);
 
 #endif /* DXP_H */

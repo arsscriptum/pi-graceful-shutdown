@@ -179,8 +179,12 @@ int signal_source_handle_connection(int conn_fd,
     unsigned char raw[1024];
     char dump[512];
     dxp_header_t hdr;
+    const unsigned char *payload;
     unsigned short initial_seq;
     int raw_len;
+    int hdr_off;
+    int payload_len;
+    int verdict;
 
     set_recv_timeout(conn_fd, RECV_TIMEOUT_S);
 
@@ -230,11 +234,14 @@ int signal_source_handle_connection(int conn_fd,
     }
 
     /* Try JSON-envelope DxP (firmware v1.40.60+), then raw DxP */
-    if (dxp_parse_json_envelope(raw, raw_len, &hdr) == 0) {
+    hdr_off = 0;
+    if (dxp_parse_json_envelope(raw, raw_len, &hdr, &hdr_off) == 0) {
         log_msg(LOG_DEBUG,
-                "connection: parsed DxP from JSON envelope");
+                "connection: parsed DxP from JSON envelope "
+                "(header at offset %d)", hdr_off);
     } else if (raw_len >= DXP_HDR_SIZE) {
         dxp_parse_header(raw, &hdr);
+        hdr_off = 0;
         log_msg(LOG_DEBUG,
                 "connection: parsed raw DxP header");
     } else {
@@ -261,15 +268,53 @@ int signal_source_handle_connection(int conn_fd,
 
     log_msg(LOG_INFO, "connection: credentials validated");
 
-    if (dxp_is_shutdown_command(&hdr)) {
+    /*
+     * Whatever follows the header is the command payload.  pcControl
+     * arrives header-only (the reference capture is exactly 47 bytes
+     * of header after a 22-byte envelope prefix), so an empty payload
+     * is normal.  changeRelay carries [relay index, state] here, and
+     * that state is what decides whether power is dropping.
+     */
+    payload = raw + hdr_off + DXP_HDR_SIZE;
+    payload_len = raw_len - hdr_off - DXP_HDR_SIZE;
+    if (payload_len < 0) {
+        payload_len = 0;
+    }
+
+    verdict = dxp_classify_shutdown(&hdr, payload, payload_len);
+
+    if (verdict == DXP_SHUTDOWN_NO_STATE) {
+        log_msg(LOG_WARNING,
+                "connection: changeRelay without a readable state "
+                "payload (%d byte(s)); not treating as shutdown",
+                payload_len);
+        return 1;
+    }
+
+    if (verdict == DXP_SHUTDOWN_YES) {
         event->command = hdr.command;
         event->desc = hdr.desc;
+        if (hdr.command == DXP_CMND_IO) {
+            log_msg(LOG_INFO,
+                    "connection: changeRelay relay=%u state=RELAX",
+                    (unsigned)payload[DXP_CR_OFF_RELAY]);
+        }
         log_msg(LOG_INFO,
                 "connection: shutdown signal received "
                 "(command=%s desc=%u)",
                 dxp_command_name(hdr.command),
                 (unsigned)hdr.desc);
         return 0;
+    }
+
+    if (hdr.command == DXP_CMND_IO &&
+        hdr.desc == DXP_IO_CHANGE_RELAY) {
+        log_msg(LOG_INFO,
+                "connection: changeRelay relay=%u state=%u "
+                "(not RELAX, ignoring)",
+                (unsigned)payload[DXP_CR_OFF_RELAY],
+                (unsigned)payload[DXP_CR_OFF_STATE]);
+        return 1;
     }
 
     log_msg(LOG_INFO,

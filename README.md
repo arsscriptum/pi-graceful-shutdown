@@ -170,13 +170,19 @@ DxP traffic from your iBoot unit:
    - Whether they are distinguishable
    - The heartbeat exchange, if any
 
-5. Encode the captured bytes as test fixtures in `test_dxp.c` (see the
-   "Capture-based tests" section) and verify the decoder handles them
-   correctly.
+5. Encode the captured bytes as test fixtures in
+   `test/dxp_decode_test.c` (see the "Capture-based tests" section)
+   and verify the decoder handles them correctly.
 
 6. If the actual command differs from the assumed `eCmnd_pcControl` or
-   `eCmnd_io`/`eIO_changeRelay`, update the `is_shutdown_command()`
-   function in `iboot-agent.c`.
+   `eCmnd_io`/`eIO_changeRelay`, update the `dxp_classify_shutdown()`
+   function in `src/dxp.c`.
+
+   Note that for `eCmnd_io`/`eIO_changeRelay` the verdict depends on
+   the 2-byte relay payload that follows the 47-byte header, not on
+   the header alone: only state `RELAX` (2) means power is dropping.
+   `ENERGIZE` (1) is the outlet coming on and must never halt the Pi.
+   See BUG_FIX.md.
 
 This step fulfils acceptance criteria AC1 and AC2.
 

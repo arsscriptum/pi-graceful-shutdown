@@ -50,16 +50,32 @@ int dxp_validate_credentials(const dxp_header_t *hdr,
     return 1;
 }
 
-int dxp_is_shutdown_command(const dxp_header_t *hdr)
+int dxp_classify_shutdown(const dxp_header_t *hdr,
+                          const unsigned char *payload,
+                          int payload_len)
 {
     if (hdr->command == DXP_CMND_PCCONTROL) {
-        return 1;
+        return DXP_SHUTDOWN_YES;
     }
+
     if (hdr->command == DXP_CMND_IO &&
         hdr->desc == DXP_IO_CHANGE_RELAY) {
-        return 1;
+        /*
+         * The relay state decides this one.  Without the payload
+         * there is no state, so refuse to halt rather than guess.
+         */
+        if (payload == NULL ||
+            payload_len < DXP_CHANGERELAY_PAYLOAD_LEN) {
+            return DXP_SHUTDOWN_NO_STATE;
+        }
+        if (payload[DXP_CR_OFF_STATE] == DXP_RELAY_RELAX) {
+            return DXP_SHUTDOWN_YES;
+        }
+        /* ENERGIZE and NO_CHANGE never halt. */
+        return DXP_SHUTDOWN_NO;
     }
-    return 0;
+
+    return DXP_SHUTDOWN_NO;
 }
 
 const char *dxp_command_name(unsigned char cmd)
@@ -87,7 +103,7 @@ const char *dxp_command_name(unsigned char cmd)
 #define DXP_JSON_HDR_OFFSET  21
 
 int dxp_parse_json_envelope(const unsigned char *buf, int len,
-                            dxp_header_t *hdr)
+                            dxp_header_t *hdr, int *hdr_off)
 {
     int brace;
     int i;
@@ -105,6 +121,10 @@ int dxp_parse_json_envelope(const unsigned char *buf, int len,
 
     if (memcmp(&buf[brace + 1], DXP_JSON_TAG, DXP_JSON_TAG_LEN) != 0)
         return -1;
+
+    if (hdr_off != NULL) {
+        *hdr_off = brace + DXP_JSON_HDR_OFFSET;
+    }
 
     dxp_parse_header(&buf[brace + DXP_JSON_HDR_OFFSET], hdr);
     return 0;
