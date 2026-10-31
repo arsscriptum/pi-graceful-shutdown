@@ -213,18 +213,71 @@ process per case so the FR6 latch does not mask a result:
 | `relax` | io/changeRelay, state 2 | halt | pass |
 | `pccontrol` | pcControl desc=2 (capture shape) | halt | pass |
 
-### Memory safety
+### Memory safety (AC10)
 
-valgrind is not installed on this machine, so AC10's tooling was not
-run here. As a substitute, both the test binary and the daemon were
-rebuilt under `-fsanitize=address,undefined` and the cases above were
-replayed: no sanitizer reports, no leaks. The long-running valgrind
-soak of AC10 still needs to be done on the Pi.
+valgrind 3.26.0, `--leak-check=full --show-leak-kinds=all
+--track-origins=yes --error-exitcode=9`.
+
+Test binary:
+
+```
+total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated
+All heap blocks were freed -- no leaks are possible
+ERROR SUMMARY: 0 errors from 0 contexts
+```
+
+Daemon, each of the seven end-to-end cases above run as its own
+valgrind'd process: 0 errors, 0 leaks, exit 0 in all seven. Both the
+halt path and the ignore path are covered.
+
+Soak, one valgrind'd daemon process handling **64 connections** without
+a restart:
+
+- 50 valid-credential exchanges across the five non-halting cases
+  (10 rounds of energize, nochange, nopayload, badcred, getrelays)
+- 9 malformed or hostile frames: empty, short random, 47 random bytes,
+  300 random bytes, all zeros, 1200 bytes (over the `raw[]` bound),
+  brace with a bad tag, a truncated envelope header, and a bad hello
+- two `SIGHUP` config reloads mid-run, with more traffic after them
+- a `RELAX` frame (halted, as it should), then a second `RELAX`
+  (suppressed by the FR6 latch)
+- `SIGTERM`, clean exit 0
+
+Result:
+
+```
+total heap usage: 14 allocs, 14 frees, 18,516 bytes allocated
+All heap blocks were freed -- no leaks are possible
+ERROR SUMMARY: 0 errors from 0 contexts
+```
+
+14 allocations for 64 connections, so the steady-state loop allocates
+nothing per connection, as CLAUDE.md Section 6 requires. Tallies from
+that run:
+
+| Outcome | Count |
+|---|---|
+| ENERGIZE or NO_CHANGE ignored | 22 (11 of each) |
+| changeRelay with no state payload | 10 |
+| credential rejections | 15 |
+| other non-shutdown commands ignored | 11 |
+| halts performed | 1 |
+| latch suppressions (FR6) | 1 |
+| config reloads (SIGHUP) | 4 log lines, 2 signals |
+| **occurrences of the shared password in the log (AC8)** | **0** |
+
+Every malformed frame was rejected and logged (`invalid hello message`,
+`no data after hello/seq`, `unrecognized frame (8 bytes)`,
+`unrecognized frame (23 bytes)`), and none halted the host (AC5).
+
+AC10 also calls for a 24 hour run on the target; this soak is the same
+code paths at much higher event density, but the duration test still
+belongs on the Pi.
 
 ### Not covered
 
 AC3, AC4, AC6 and AC7 need the real iBoot-G2+ and the Pi; they were not
-re-run as part of this fix. The `changeRelay` payload layout itself is
+re-run as part of this fix, nor was AC10's 24 hour duration. The `changeRelay` payload layout itself is
 taken from the DxP protocol documentation and the patch, and is not yet
 confirmed by a capture of a real `changeRelay` frame, because the
 capture in `references/results.txt` only contains `pcControl`. The
