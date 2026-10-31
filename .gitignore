@@ -11,6 +11,12 @@ iboot-agent
 *.sln.docstates
 *.env
 
+iboot-agent-relay-state-fix.patch
+scripts/pi-server-scripts
+scripts/pi-server-scripts/**
+
+src/*.o
+
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 
