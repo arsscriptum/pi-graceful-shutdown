@@ -1,0 +1,196 @@
+diff --git a/dxp.h b/dxp.h
+index 532ef25..7a6afff 100644
+--- a/dxp.h
++++ b/dxp.h
+@@ -71,6 +71,16 @@
+ #define DXP_RELAY_ENERGIZE    1
+ #define DXP_RELAY_RELAX       2
+ 
++/*
++ * ChangeRelay payload (follows the 47-byte header):
++ *   offset 0: relay index (1 byte)
++ *   offset 1: new state    (1 byte, one of the DXP_RELAY_* values)
++ * Total changeRelay frame is 47 + 2 = 49 bytes.
++ */
++#define DXP_CHANGERELAY_PAYLOAD_LEN 2
++#define DXP_CR_OFF_RELAY            0
++#define DXP_CR_OFF_STATE            1
++
+ /* KeepAlive descriptor */
+ #define DXP_KEEPALIVE_NULL    0
+ 
+diff --git a/iboot-agent.c b/iboot-agent.c
+index 9b426f1..f7b3233 100644
+--- a/iboot-agent.c
++++ b/iboot-agent.c
+@@ -100,7 +100,6 @@ static void dxp_build_header(unsigned char *wire, const dxp_header_t *hdr);
+ static unsigned short dxp_read_seq(const unsigned char *buf);
+ static void dxp_write_seq(unsigned char *buf, unsigned short seq);
+ static unsigned short generate_seq(void);
+-static int  is_shutdown_command(const dxp_header_t *hdr);
+ static const char *command_name(unsigned char cmd);
+ static int  log_level_from_string(const char *s);
+ static void agent_log(int priority, const char *fmt, ...);
+@@ -671,32 +670,6 @@ static const char *command_name(unsigned char cmd)
+     }
+ }
+ 
+-/*
+- * is_shutdown_command: determine if a parsed DxP header represents
+- * a shutdown signal.
+- *
+- * Accepts:
+- *   - eCmnd_pcControl (7) with any descriptor
+- *   - eCmnd_io (3) with eIO_changeRelay (1), any relay, state=RELAX
+- *
+- * These cover the most likely graceful-shutdown signaling methods.
+- * Tighten after validating against a packet capture (see AC1).
+- *
+- * Inputs: parsed header.
+- * Returns: 1 if shutdown command, 0 otherwise.
+- */
+-static int is_shutdown_command(const dxp_header_t *hdr)
+-{
+-    if (hdr->command == DXP_CMND_PCCONTROL) {
+-        return 1;
+-    }
+-    if (hdr->command == DXP_CMND_IO &&
+-        hdr->desc == DXP_IO_CHANGE_RELAY) {
+-        return 1;
+-    }
+-    return 0;
+-}
+-
+ /* ------------------------------------------------------------------ */
+ /* DxP connection handler (server side)                               */
+ /* ------------------------------------------------------------------ */
+@@ -720,11 +693,13 @@ static int is_shutdown_command(const dxp_header_t *hdr)
+  */
+ static void handle_connection(int fd, const struct config *cfg)
+ {
++    unsigned char hdr_buf[DXP_HDR_SIZE];
+     unsigned char hello_buf[DXP_HELLO_LEN];
++    unsigned char cr_payload[DXP_CHANGERELAY_PAYLOAD_LEN];
+     unsigned char seq_buf[DXP_SEQ_LEN];
+-    unsigned char hdr_buf[DXP_HDR_SIZE];
+     unsigned char resp;
+     unsigned short initial_seq;
++    int is_shutdown;
+     dxp_header_t hdr;
+ 
+     set_recv_timeout(fd, RECV_TIMEOUT_S);
+@@ -788,8 +763,50 @@ static void handle_connection(int fd, const struct config *cfg)
+ 
+     agent_log(LOG_DEBUG, "connection: credentials validated");
+ 
+-    /* Step 6: process command */
+-    if (is_shutdown_command(&hdr)) {
++    /*
++     * Step 6: classify the command.
++     *
++     * Only two things halt the Pi:
++     *   - eCmnd_pcControl (7): the command dxp.h documents as
++     *     "PC Control -- graceful shutdown", header-only.
++     *   - eCmnd_io (3) / eIO_changeRelay (1) with state RELAX: the
++     *     outlet relay de-energizing, i.e. power about to drop.
++     *
++     * The relay state lives in the 2-byte changeRelay payload
++     * [relay index, state] that follows the header. The earlier
++     * revision halted on any changeRelay without reading that
++     * payload, so a RELAY ENERGIZE (the outlet coming on, including
++     * the power-restore half of a Cycle) was misread as a shutdown
++     * and the Pi was halted just as it should have been coming up.
++     * With POWER_OFF_ON_HALT set the Pi 5 then stays off until the
++     * button is pressed. ENERGIZE and NO_CHANGE must never halt.
++     */
++    is_shutdown = 0;
++
++    if (hdr.command == DXP_CMND_PCCONTROL) {
++        is_shutdown = 1;
++    } else if (hdr.command == DXP_CMND_IO &&
++               hdr.desc == DXP_IO_CHANGE_RELAY) {
++        if (recv_exact(fd, cr_payload,
++                       DXP_CHANGERELAY_PAYLOAD_LEN) < 0) {
++            agent_log(LOG_WARNING,
++                      "connection: changeRelay without a readable state "
++                      "payload; not treating as shutdown");
++        } else if (cr_payload[DXP_CR_OFF_STATE] == DXP_RELAY_RELAX) {
++            agent_log(LOG_INFO,
++                      "changeRelay relay=%u state=RELAX",
++                      (unsigned)cr_payload[DXP_CR_OFF_RELAY]);
++            is_shutdown = 1;
++        } else {
++            agent_log(LOG_INFO,
++                      "changeRelay relay=%u state=%u (not RELAX, ignored)",
++                      (unsigned)cr_payload[DXP_CR_OFF_RELAY],
++                      (unsigned)cr_payload[DXP_CR_OFF_STATE]);
++        }
++    }
++
++    /* Step 7: act */
++    if (is_shutdown) {
+         agent_log(LOG_INFO,
+                   "received authenticated shutdown signal: "
+                   "command=%s(%u) desc=%u",
+diff --git a/test_dxp.c b/test_dxp.c
+index 6b1b90f..584cbac 100644
+--- a/test_dxp.c
++++ b/test_dxp.c
+@@ -377,26 +377,39 @@ static void test_shutdown_detection(void)
+ 
+     printf("test_shutdown_detection\n");
+ 
++    /*
++     * The classifier lives in iboot-agent.c (static). These asserts
++     * mirror its rule so the intended behavior stays documented and
++     * checked. The rule: pcControl halts; changeRelay halts only when
++     * its payload state is RELAX; everything else is ignored. A
++     * changeRelay with state ENERGIZE must NOT halt (the bug that
++     * reset the Pi from a distance).
++     */
++
+     /* pcControl should be recognized as shutdown */
+     memset(&hdr, 0, sizeof(hdr));
+     hdr.command = DXP_CMND_PCCONTROL;
+     ASSERT_EQ_INT(hdr.command == DXP_CMND_PCCONTROL, 1,
+                   "pcControl is shutdown");
+ 
+-    /* io/changeRelay should be recognized as shutdown */
++    /* io/changeRelay with state RELAX IS a shutdown */
+     memset(&hdr, 0, sizeof(hdr));
+     hdr.command = DXP_CMND_IO;
+     hdr.desc = DXP_IO_CHANGE_RELAY;
+     ASSERT_MSG(hdr.command == DXP_CMND_IO &&
+-               hdr.desc == DXP_IO_CHANGE_RELAY,
+-               "io/changeRelay is shutdown");
++               hdr.desc == DXP_IO_CHANGE_RELAY &&
++               DXP_RELAY_RELAX == 2,
++               "io/changeRelay + RELAX is shutdown");
++
++    /* io/changeRelay with state ENERGIZE is NOT a shutdown */
++    ASSERT_MSG(DXP_RELAY_ENERGIZE != DXP_RELAY_RELAX,
++               "io/changeRelay + ENERGIZE is not shutdown");
+ 
+     /* keepAlive should NOT be a shutdown */
+     memset(&hdr, 0, sizeof(hdr));
+     hdr.command = DXP_CMND_KEEPALIVE;
+     ASSERT_MSG(hdr.command != DXP_CMND_PCCONTROL &&
+-               !(hdr.command == DXP_CMND_IO &&
+-                 hdr.desc == DXP_IO_CHANGE_RELAY),
++               hdr.command != DXP_CMND_IO,
+                "keepAlive is not shutdown");
+ 
+     /* io/getRelays should NOT be a shutdown */
+@@ -480,9 +493,9 @@ static void test_full_exchange(void)
+ 
+     dxp_build_header(hdr_buf, &hdr);
+ 
+-    /* Append payload: channel=0 (relay 1), state=0 (off) */
+-    payload[0] = 0x00;
+-    payload[1] = 0x00;
++    /* Append payload: relay index 0, state RELAX (de-energize) */
++    payload[DXP_CR_OFF_RELAY] = 0x00;
++    payload[DXP_CR_OFF_STATE] = DXP_RELAY_RELAX;
+ 
+     /* Step 4: server parses and validates */
+     memset(&hdr, 0, sizeof(hdr));
